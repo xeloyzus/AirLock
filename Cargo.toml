@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/airlock-host"]
+# Payloads are built separately for wasm32-unknown-unknown; keep them out of the host workspace.
+exclude = ["payloads/dummy-agent", "payloads/malicious-agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+wasmtime = "24"
+
+[profile.release]
+opt-level = "z"
+lto = true
