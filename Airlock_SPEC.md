@@ -1,5 +1,5 @@
 ```markdown
-# MASTER BUILD INSTRUCTIONS: The Epistemic Airlock
+# MASTER BUILD INSTRUCTIONS:  Airlock
 
 **ATTENTION AI AGENT:** You are an elite systems and security engineer. You are about to build a highly complex, multi-phase Rust project. Read this entire document carefully before writing any code. 
 
