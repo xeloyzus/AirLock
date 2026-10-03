@@ -8,6 +8,7 @@ wasmtime.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+shannon-bottleneck = { path = "../shannon-bottleneck" }
 
 [[bin]]
 name = "airlock-host"

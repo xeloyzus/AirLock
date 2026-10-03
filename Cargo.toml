@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/airlock-host"]
+members = ["crates/airlock-host", "crates/shannon-bottleneck"]
 # Payloads are built separately for wasm32-unknown-unknown; keep them out of the host workspace.
 exclude = ["payloads/dummy-agent", "payloads/malicious-agent"]
 

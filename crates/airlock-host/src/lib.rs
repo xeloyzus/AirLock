@@ -9,7 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::info;
+use log::{error, info};
+use shannon_bottleneck::ShannonBottleneck;
 use wasmtime::{
     Config, Engine, ExternType, Instance, Linker, Memory, Module, Store, TypedFunc, Val,
 };
@@ -25,12 +26,18 @@ pub const DUMMY_SECRET: &str = "AIRLOCK-SECRET-0123456789";
 struct AirlockState {
     /// Captured guest output (routed through the Shannon Bottleneck in Phase 2).
     captured_output: Vec<u8>,
+    /// Layer 2: sliding-window entropy filter on every egress byte.
+    bottleneck: ShannonBottleneck,
+    /// Set when the bottleneck trips; aborts the agent and condemns the stream.
+    exfiltration_detected: bool,
 }
 
 impl AirlockState {
     fn new() -> Self {
         Self {
             captured_output: Vec::new(),
+            bottleneck: ShannonBottleneck::new(),
+            exfiltration_detected: false,
         }
     }
 }
@@ -47,7 +54,7 @@ pub struct InputHandle {
 }
 
 /// Wasm signature of the guest's prompt setter: `(ptr: i32, len: i32)`.
-type WasmSetter = (u32, u32) -> ();
+type WasmSetter = fn((u32, u32)) -> ();
 
 /// Result of one ephemeral agent execution.
 pub struct ExecutionOutcome {
@@ -75,19 +82,38 @@ impl AirlockHost {
 
         let mut linker: Linker<AirlockState> = Linker::new(&engine);
 
-        // host::log(ptr, len): copy bytes out of guest memory with strict checks.
+        // host::log(ptr, len): copy bytes out of guest memory with strict checks,
+        // then route them through the Shannon Bottleneck (Layer 2) BEFORE they
+        // can reach stdout. High-entropy windows drop the output, log a
+        // SECURITY TRAP, and halt the agent immediately.
         linker.func_wrap(
             "host",
             "log",
             |mut caller: wasmtime::Caller<'_, AirlockState>, ptr: u32, len: u32| {
+                let state = caller.data_mut();
+                if state.exfiltration_detected {
+                    bail!("SECURITY TRAP: Exfiltration Detected (stream condemned; agent halted)");
+                }
                 let bytes = read_guest_bytes(&mut caller, ptr, len)?;
-                // Phase 2 hook point: route `bytes` through the Shannon Bottleneck
-                // before they reach stdout. For now, capture them verbatim.
-                caller
-                    .data_mut()
-                    .captured_output
-                    .extend_from_slice(&bytes);
-                Ok(())
+                let verdict = caller.data_mut().bottleneck.feed(&bytes);
+                match verdict {
+                    Ok(()) => {
+                        caller
+                            .data_mut()
+                            .captured_output
+                            .extend_from_slice(&bytes);
+                        Ok(())
+                    }
+                    Err(violation) => {
+                        let message = violation.message();
+                        error!("{message}");
+                        let state = caller.data_mut();
+                        state.exfiltration_detected = true;
+                        // Drop ALL captured output — nothing gets past the airlock.
+                        state.captured_output.clear();
+                        Err(anyhow!(message))
+                    }
+                }
             },
         )?;
 
@@ -151,7 +177,13 @@ impl AirlockHost {
             .context("agent trapped during execution")?;
 
         let fuel_remaining = store.get_fuel().unwrap_or(0);
-        let output = String::from_utf8_lossy(&store.into_inner().captured_output).into_owned();
+        let state = store.into_inner();
+        // Stream ended cleanly: release any bytes the bottleneck was still
+        // holding in its sub-window buffer. (On a trip we never get here —
+        // `host::log` returned an error and the agent was halted.)
+        let mut output = String::from_utf8_lossy(&state.captured_output).into_owned();
+        let tail = state.bottleneck.flush();
+        output.push_str(&String::from_utf8_lossy(&tail));
 
         Ok(ExecutionOutcome {
             output,
@@ -208,7 +240,9 @@ impl AirlockHost {
             .context("agent trapped during execution")?;
 
         let fuel_remaining = store.get_fuel().unwrap_or(0);
-        let output = String::from_utf8_lossy(&store.into_inner().captured_output).into_owned();
+        let state = store.into_inner();
+        let mut output = String::from_utf8_lossy(&state.captured_output).into_owned();
+        output.push_str(&String::from_utf8_lossy(&state.bottleneck.flush()));
 
         Ok(ExecutionOutcome {
             output,
@@ -518,5 +552,62 @@ mod tests {
             .expect_err("oversized input must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("exceeds guest input buffer"), "got: {msg}");
+    }
+
+    // ---- Phase 2: Shannon Bottleneck integration ---------------------
+
+    #[test]
+    fn english_output_still_passes_end_to_end() {
+        let h = host();
+        let wat = r#"(module
+            (import "host" "log" (func $log (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "the quick brown fox jumps over the lazy dog while it rains outside")
+            (func (export "run")
+                (call $log (i32.const 0) (i32.const 70)))
+        )"#;
+        let m = Module::new(h.engine_ref(), wat.as_bytes()).expect("compile wat");
+        let out = h.execute(&m).expect("english output must pass");
+        assert!(out.output.starts_with("the quick brown fox"));
+    }
+
+    #[test]
+    fn base64_exfiltration_is_blocked_and_halts_agent() {
+        let h = AirlockHost::new(1_000_000).expect("host builds");
+        // Guest logs a high-entropy Base64 blob -> bottleneck trips mid-call,
+        // the trap propagates as a wasm error, and the agent halts.
+        let wat = r#"(module
+            (import "host" "log" (func $log (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "SGVsbG8sIHdvcmxkIQkhIjAjQCQlXiBeJipAKABgAGIAZgBoAHIAeA")
+            (func (export "run")
+                (call $log (i32.const 0) (i32.const 52)))
+        )"#;
+        let m = Module::new(h.engine_ref(), wat.as_bytes()).expect("compile wat");
+        let err = h.execute(&m).expect_err("base64 egress must be blocked");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("SECURITY TRAP: Exfiltration Detected"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn benign_prefix_is_dropped_when_later_output_trips() {
+        let h = AirlockHost::new(1_000_000).expect("host builds");
+        // First log call is harmless English; the second is high-entropy.
+        // The whole stream (including the benign prefix) must be condemned.
+        let wat = r#"(module
+            (import "host" "log" (func $log (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0)   "hello friend, here is my report today. ")
+            (data (i32.const 64)  "aB3$eF6#gH9!jK2%mN5&nP8@qR1*sT4+uW7^")
+            (func (export "run")
+                (call $log (i32.const 0) (i32.const 37))
+                (call $log (i32.const 64) (i32.const 36)))
+        )"#;
+        let m = Module::new(h.engine_ref(), wat.as_bytes()).expect("compile wat");
+        let err = h.execute(&m).expect_err("trip must abort execution");
+        assert!(format!("{err:#}").contains("Exfiltration Detected"));
     }
 }
