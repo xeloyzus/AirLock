@@ -450,7 +450,7 @@ fn extract_triples(all_words: &[String]) -> Vec<Triple> {
         Some(s) => s.clone(),
         None => return Vec::new(),
     };
-    let rest: Vec<String> = iter.collect();
+    let rest: Vec<String> = iter.cloned().collect();
     if rest.len() < 2 {
         // Not enough survivors for a full S-P-O projection: bare mention.
         let mut out = vec![Triple {

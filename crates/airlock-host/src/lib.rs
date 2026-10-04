@@ -13,7 +13,8 @@ use log::{error, info};
 use shannon_bottleneck::ShannonBottleneck;
 use shadow_verifier::{StateVerifier, ToolCall, Verdict};
 use wasmtime::{
-    Config, Engine, ExternType, Instance, Linker, Memory, Module, Store, TypedFunc, Val,
+    AsContextMut, Config, Engine, ExternType, Instance, Linker, Memory, Module, Store, TypedFunc,
+    Val,
 };
 
 /// Default fuel budget for a single ephemeral execution (Phase 1 spec: 10_000).
@@ -72,6 +73,9 @@ struct AirlockState {
     exfiltration_detected: bool,
     /// Layer 1: formal verdict on the most recent tool call, for audit.
     last_tool_verdict: Option<String>,
+    /// Cached handle to the guest's single exported linear memory (resolved
+    /// lazily on the first host call that touches memory).
+    guest_memory: Option<wasmtime::Memory>,
 }
 
 impl AirlockState {
@@ -81,6 +85,7 @@ impl AirlockState {
             bottleneck: ShannonBottleneck::new(),
             exfiltration_detected: false,
             last_tool_verdict: None,
+            guest_memory: None,
         }
     }
 }
@@ -93,11 +98,12 @@ pub struct InputHandle {
     memory: Memory,
     buffer_ptr: u32,
     buffer_len: u32,
-    setter: Arc<Mutex<Option<TypedFunc<WasmSetter>>>>,
+    setter: Arc<Mutex<Option<WasmSetterFn>>>,
 }
 
-/// Wasm signature of the guest's prompt setter: `(ptr: i32, len: i32)`.
-type WasmSetter = fn((u32, u32)) -> ();
+/// Wasm signature of the guest's prompt setter: `(ptr: i32, len: i32) -> ()`.
+// Wasm signature of the guest's prompt setter: `(ptr: i32, len: i32)` -> ().
+type WasmSetterFn = wasmtime::TypedFunc<(u32, u32), ()>;
 
 /// Result of one ephemeral agent execution.
 pub struct ExecutionOutcome {
@@ -279,8 +285,11 @@ impl AirlockHost {
         // Static import audit BEFORE instantiation: only the whitelisted
         // host functions may ever be linked. No WASI, no env, no fd.
         for imp in module.imports() {
-            let name = imp.name().unwrap_or("");
-            if imp.module() != "host" || !is_whitelisted_host_fn(name) {
+            let name = imp.name();
+            // The airlock only ever links *functions*; an import of any other
+            // kind (memory/global/table) cannot be satisfied by the linker.
+            let is_func = matches!(imp.ty(), ExternType::Func(_));
+            if !is_func || imp.module() != "host" || !is_whitelisted_host_fn(name) {
                 bail!(
                     "SECURITY TRAP: module imports violate the airlock policy \
                      (import \"{}\" \"{}\")",
@@ -306,11 +315,11 @@ impl AirlockHost {
             .get_func(&mut store, "run")
             .ok_or_else(|| anyhow!("module does not export `run`"))?;
 
-        run.invoke(&mut store, &[], &mut [])
+        run.call(&mut store, &[], &mut [])
             .context("agent trapped during execution")?;
 
         let fuel_remaining = store.get_fuel().unwrap_or(0);
-        let state = store.into_inner();
+        let mut state = store.into_data();
         // Stream ended cleanly: release any bytes the bottleneck was still
         // holding in its sub-window buffer. (On a trip we never get here —
         // `host::log` returned an error and the agent was halted.)
@@ -332,7 +341,9 @@ impl AirlockHost {
         input: &str,
     ) -> Result<ExecutionOutcome> {
         let mut store = Store::new(&self.engine, AirlockState::new());
-        store.set_fuel(self.fuel)?;
+        store
+            .set_fuel(self.fuel)
+            .context("fuel consumption is required but was rejected")?;
 
         let instance = self
             .linker
@@ -343,7 +354,7 @@ impl AirlockHost {
 
         let memory = export_memory(&instance, &mut store)?;
         let buffer_len = read_u32_global(&instance, &mut store, "INPUT_BUFFER_LEN")?;
-        let setter: TypedFunc<WasmSetter> = instance
+        let setter: WasmSetterFn = instance
             .get_func(&mut store, "set_input")
             .context("module does not export `set_input`")?
             .typed(&mut store)?;
@@ -354,9 +365,16 @@ impl AirlockHost {
 
         // Step 1: let the guest publish its runtime addresses (Rust cannot
         // materialize static addresses in const context, so `INPUT_BUFFER_PTR`
-        // is written by the first instruction of `run`).
-        run.call(&mut store, ())
-            .context("agent trapped publishing input buffer address")?;
+        // is written by the first instruction of `run`). A guest may also
+        // export the pointer as an IMMUTABLE global (hand-written WAT and the
+        // API's built-in demo payload do exactly that): if it is already
+        // non-zero there is nothing to publish — skip the warm-up call so a
+        // two-phase guest never executes its main body before injection.
+        let published = read_u32_global(&instance, &mut store, "INPUT_BUFFER_PTR")?;
+        if published == 0 {
+            run.call(&mut store, ())
+                .context("agent trapped publishing input buffer address")?;
+        }
         let buffer_ptr = read_u32_global(&instance, &mut store, "INPUT_BUFFER_PTR")?;
 
         // Step 2: bounds-checked injection of the (sanitized) prompt.
@@ -369,11 +387,11 @@ impl AirlockHost {
         handle.inject(&mut store, input)?;
 
         // Step 3: hand control back to the agent proper.
-        run.invoke(&mut store, &[], &mut [])
+        run.call(&mut store, ())
             .context("agent trapped during execution")?;
 
         let fuel_remaining = store.get_fuel().unwrap_or(0);
-        let state = store.into_inner();
+        let mut state = store.into_data();
         let mut output = String::from_utf8_lossy(&state.captured_output).into_owned();
         output.push_str(&String::from_utf8_lossy(&state.bottleneck.flush()));
 
@@ -461,9 +479,28 @@ impl InputHandle {
                 self.buffer_len
             );
         }
-        let view = self.memory.view(&*store);
-        view.write(self.buffer_ptr.into(), bytes)
-            .map_err(|e| anyhow!("SECURITY TRAP: bounds violation writing input: {e}"))?;
+        let size = self.memory.data_size(&*store) as u64;
+        let start = u64::from(self.buffer_ptr);
+        let end = start
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow!("SECURITY TRAP: arithmetic overflow in input pointer"))?;
+        if end > size {
+            bail!(
+                "SECURITY TRAP: out-of-bounds input write ptr={} len={} (memory size={size})",
+                self.buffer_ptr,
+                bytes.len()
+            );
+        }
+        // SAFETY: bounds proven above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.memory
+                    .data_ptr(store.as_context_mut())
+                    .add(usize::try_from(start).unwrap()),
+                bytes.len(),
+            );
+        }
 
         let setter = self
             .setter
@@ -481,17 +518,26 @@ fn export_memory(
     instance: &Instance,
     store: &mut Store<AirlockState>,
 ) -> Result<Memory> {
-    instance
-        .exports(&mut *store)
-        .filter_map(|exp| {
-            if matches!(exp.ty(), ExternType::Memory(_)) {
-                exp.clone().into_memory()
-            } else {
-                None
+    // Borrow-split: collect candidate memories first, then resolve types with
+    // a second pass over a fresh iterator (the Exports iterator holds the
+    // store borrow for its whole lifetime).
+    let count = instance.exports(&mut *store).count();
+    for i in 0..count {
+        // Re-create the borrow per index: `Export` holds a store lifetime.
+        let name_opt = instance
+            .exports(&mut *store)
+            .nth(i)
+            .map(|exp| (exp.name().to_string(), exp.clone().into_memory().is_some()));
+        if let Some((name, true)) = name_opt {
+            if let Some(m) = instance
+                .get_export(&mut *store, name.as_str())
+                .and_then(|e| e.into_memory())
+            {
+                return Ok(m);
             }
-        })
-        .next()
-        .ok_or_else(|| anyhow!("module exports no memory"))
+        }
+    }
+    Err(anyhow!("module exports no memory"))
 }
 
 fn read_u32_global(
@@ -515,8 +561,9 @@ fn read_guest_bytes(
     len: u32,
 ) -> Result<Vec<u8>> {
     let memory = find_memory(caller).context("guest called host without exporting memory")?;
-    let view = memory.view(&*caller);
-    let size = u64::from(view.data_size().try_into().unwrap_or(u32::MAX));
+    let ctx = caller.as_context_mut();
+    let size = memory.data_size(&ctx) as u64;
+    drop(ctx);
     let start = u64::from(ptr);
     let end = start
         .checked_add(u64::from(len))
@@ -526,9 +573,10 @@ fn read_guest_bytes(
             "SECURITY TRAP: out-of-bounds read ptr={ptr} len={len} (memory size={size})"
         );
     }
-    let mut buf = vec![0u8; len as usize];
-    view.read(start, &mut buf)
-        .map_err(|e| anyhow!("SECURITY TRAP: read failed: {e}"))?;
+    // SAFETY: bounds proven above; slice lives only for this copy.
+    let ctx = caller.as_context_mut();
+    let raw = unsafe { std::slice::from_raw_parts(memory.data_ptr(&ctx).add(usize::try_from(start).unwrap()), len as usize) };
+    let buf = raw.to_vec();
     Ok(buf)
 }
 
@@ -539,8 +587,7 @@ fn write_guest_bytes(
     bytes: &[u8],
 ) -> Result<()> {
     let memory = find_memory(caller).context("guest called host without exporting memory")?;
-    let view = memory.view(&*caller);
-    let size = view.data_size();
+    let size = memory.data_size(&*caller) as u64;
     let start = u64::from(ptr);
     let end = start
         .checked_add(bytes.len() as u64)
@@ -551,23 +598,29 @@ fn write_guest_bytes(
             bytes.len()
         );
     }
-    view.write(start, bytes)
-        .map_err(|e| anyhow!("SECURITY TRAP: write failed: {e}"))?;
+    // SAFETY: bounds proven above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            memory.data_ptr(caller.as_context_mut()).add(usize::try_from(start).unwrap()),
+            bytes.len(),
+        );
+    }
     Ok(())
 }
 
-/// Locate the guest's exported memory from within a host call.
-fn find_memory(caller: &wasmtime::Caller<'_, AirlockState>) -> Option<Memory> {
-    caller
-        .exports()
-        .filter_map(|e| {
-            if matches!(e.ty(), ExternType::Memory(_)) {
-                e.clone().into_memory()
-            } else {
-                None
-            }
-        })
-        .next()
+/// Locate the guest's exported linear memory from within a host call.
+/// The airlink ABI requires exactly one exported memory; by convention (Rust
+/// cdylibs and hand-written WAT alike) it is named "memory". We cache the
+/// resolved handle in per-store state so repeated host calls are O(1).
+fn find_memory(caller: &mut wasmtime::Caller<'_, AirlockState>) -> Option<Memory> {
+    if caller.data().guest_memory.is_none() {
+        let resolved = ["memory", "mem"]
+            .iter()
+            .find_map(|n| caller.get_export(n).and_then(|e| e.into_memory()));
+        caller.data_mut().guest_memory = resolved;
+    }
+    caller.data().guest_memory
 }
 
 /// Convenience: load a wasm file from disk and execute it.
