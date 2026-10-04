@@ -144,9 +144,15 @@ impl TrapReport {
     }
 }
 
-/// Red-team directive for the `malicious-agent` payload (Phase 6): a triple
-/// whose subject is literally `vector`. The payload scans its injected input
-/// for `"subject":"vector"` plus the vector name and executes that attack.
+/// Red-team directive for the `malicious-agent` payload (Phase 6).
+///
+/// The payload selects its attack by scanning the *sanitized prompt JSON*
+/// injected into guest memory for a triple whose subject is literally
+/// `vector`. Layer 3's JSON flattener maps
+/// `{"subject":"vector","predicate":"...","object":"<name>"}` onto a triple
+/// with `subject_here == "vector"` and `has_object == "<name>"` verbatim
+/// (single-token objects survive normalization untouched), which is exactly
+/// what the payload's `"subject":"vector"` + name matcher expects.
 pub fn vector_triple_json(vector: &str) -> String {
     serde_json::to_string(&vec![Triple::new("vector", "set to", vector)])
         .expect("triples are serializable")
