@@ -1,0 +1,25 @@
+[package]
+name = "shadow-verifier"
+version.workspace = true
+edition.workspace = true
+
+# Layer 1: Shadow-State Verifier.
+#
+# The `z3-prover` feature (default) wires in the real Z3 Theorem Prover via
+# the `z3` crate, statically linked per spec (`features = ["static-link-z3"]`)
+# so the host does not need a system libz3. Building that feature requires a
+# working C++ toolchain; if it fails on this machine, build with
+# `--no-default-features` and the `MockVerifier` string-matching fallback
+# takes over automatically (Rules of Engagement #7).
+[features]
+default = ["z3-prover"]
+z3-prover = ["dep:z3"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+z3 = { version = "0.21", features = ["static-link-z3"], optional = true }
+
+[lib]
+name = "shadow_verifier"
+path = "src/lib.rs"
