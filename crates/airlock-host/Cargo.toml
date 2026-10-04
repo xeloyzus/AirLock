@@ -3,12 +3,18 @@ name = "airlock-host"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["z3-prover"]
+# Forwarded to shadow-verifier: real Z3 theorem prover vs. MockVerifier fallback.
+z3-prover = ["shadow-verifier/z3-prover"]
+
 [dependencies]
 wasmtime.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 shannon-bottleneck = { path = "../shannon-bottleneck" }
+shadow-verifier = { path = "../shadow-verifier", default-features = false }
 
 [[bin]]
 name = "airlock-host"
