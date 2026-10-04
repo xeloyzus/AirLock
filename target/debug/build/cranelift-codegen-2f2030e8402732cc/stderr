@@ -1,0 +1,28 @@
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/settings.rs
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/types.rs
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/opcodes.rs
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/inst_builder.rs
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/settings-x86.rs
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/clif_opt.isle
+Writing generated file: /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/clif_lower.isle
+Rebuilding /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_opt.rs
+error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.
+help: run `rustup component add rustfmt` to install it
+Writing ISLE-generated Rust code to /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_opt.rs
+Rebuilding /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_x64.rs
+error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.
+help: run `rustup component add rustfmt` to install it
+Writing ISLE-generated Rust code to /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_x64.rs
+Rebuilding /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_aarch64.rs
+error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.
+help: run `rustup component add rustfmt` to install it
+Writing ISLE-generated Rust code to /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_aarch64.rs
+Rebuilding /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_s390x.rs
+error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.
+help: run `rustup component add rustfmt` to install it
+Writing ISLE-generated Rust code to /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_s390x.rs
+Rebuilding /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_riscv64.rs
+error: 'rustfmt' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.
+help: run `rustup component add rustfmt` to install it
+Writing ISLE-generated Rust code to /workspace/target/debug/build/cranelift-codegen-2f2030e8402732cc/out/isle_riscv64.rs
+fatal: not a git repository (or any of the parent directories): .git

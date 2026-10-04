@@ -1,0 +1,13 @@
+[package]
+name = "dummy-agent"
+version = "0.1.0"
+edition = "2021"
+
+# Built separately for wasm32-unknown-unknown (excluded from the host workspace).
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"

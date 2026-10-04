@@ -1,0 +1,10 @@
+[package]
+name = "shannon-bottleneck"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[lib]
+name = "shannon_bottleneck"
+path = "src/lib.rs"
