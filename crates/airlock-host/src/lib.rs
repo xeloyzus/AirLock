@@ -244,6 +244,35 @@ impl AirlockHost {
             .context("failed to compile wasm module")
     }
 
+    /// Full pipeline used by the Phase 5 control plane (and any caller that
+    /// supplies an untrusted prompt): sanitize FIRST, then execute. The raw
+    /// prompt never touches guest memory — only the lossy triple JSON does.
+    /// Layer 1 gates every tool call and Layer 2 filters every egress byte
+    /// during execution.
+    pub fn run_sanitized(
+        &self,
+        wasm_bytes: &[u8],
+        raw_prompt: &str,
+    ) -> Result<(ExecutionOutcome, ontological_sanitizer::SanitizedPrompt)> {
+        let sanitized = ontological_sanitizer::sanitize_prompt(raw_prompt);
+        let json = sanitized.to_sanitized_json();
+        let module = self.load_module(wasm_bytes)?;
+        let outcome = self.execute_with_input(&module, &json)?;
+        Ok((outcome, sanitized))
+    }
+
+    /// One-shot convenience for callers that already hold sanitized bytes
+    /// (e.g. the API control plane): load + inject + run in a single ephemeral
+    /// store. Returns the bottleneck-cleared output and remaining fuel.
+    pub fn run_wasm_bytes_with_input(
+        &self,
+        wasm_bytes: &[u8],
+        input: &str,
+    ) -> Result<ExecutionOutcome> {
+        let module = self.load_module(wasm_bytes)?;
+        self.execute_with_input(&module, input)
+    }
+
     /// Instantiate a module, verify its imports are airlock-whitelisted, and
     /// run its exported `run` function under the fuel budget.
     pub fn execute(&self, module: &Module) -> Result<ExecutionOutcome> {

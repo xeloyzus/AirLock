@@ -1,0 +1,40 @@
+[package]
+name = "airlock-api"
+version.workspace = true
+edition.workspace = true
+
+# Phase 5: Control Plane. Axum HTTP front-end that orchestrates all four
+# airlock layers per request: Ontological Sanitizer -> Ephemeral Wasm Host
+# (with Shadow Verifier tool gating + Shannon Bottleneck egress filtering).
+#
+# The `z3-prover` feature is forwarded to airlock-host; build with
+# `--no-default-features` to run the whole control plane on the MockVerifier
+# fallback (Rules of Engagement #7).
+[features]
+default = ["z3-prover"]
+z3-prover = ["airlock-host/z3-prover"]
+
+[dependencies]
+airlock-host = { path = "../airlock-host", default-features = false }
+ontological-sanitizer = { path = "../ontological-sanitizer" }
+shadow-verifier = { path = "../shadow-verifier", default-features = false }
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "airlock-api"
+path = "src/main.rs"
+
+[lib]
+name = "airlock_api"
+path = "src/lib.rs"
+
+[dev-dependencies]
+shadow-verifier = { path = "../shadow-verifier", features = ["z3-prover"] }

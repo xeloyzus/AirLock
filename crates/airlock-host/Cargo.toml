@@ -14,7 +14,11 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 shannon-bottleneck = { path = "../shannon-bottleneck" }
+ontological-sanitizer = { path = "../ontological-sanitizer" }
 shadow-verifier = { path = "../shadow-verifier", default-features = false }
+
+[dev-dependencies]
+wat.workspace = true
 
 [[bin]]
 name = "airlock-host"
