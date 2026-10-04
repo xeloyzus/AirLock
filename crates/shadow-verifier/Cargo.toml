@@ -18,7 +18,7 @@ z3-prover = ["dep:z3"]
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
-z3 = { version = "0.21", features = ["static-link-z3"], optional = true }
+z3 = { version = "0.21", features = ["bundled"], optional = true }
 
 [lib]
 name = "shadow_verifier"

@@ -133,7 +133,7 @@ pub struct TrapReport {
 }
 
 impl TrapReport {
-    fn into_response(self, status: StatusCode) -> Response {
+    pub(crate) fn into_response(self, status: StatusCode) -> Response {
         // Log loudly on the server side for red-team analysis (Phase 6).
         error!(
             "SECURITY TRAP caught by {}: {}",
@@ -142,6 +142,14 @@ impl TrapReport {
         );
         (status, Json(serde_json::to_value(&self).unwrap_or_default())).into_response()
     }
+}
+
+/// Red-team directive for the `malicious-agent` payload (Phase 6): a triple
+/// whose subject is literally `vector`. The payload scans its injected input
+/// for `"subject":"vector"` plus the vector name and executes that attack.
+pub fn vector_triple_json(vector: &str) -> String {
+    serde_json::to_string(&vec![Triple::new("vector", "set to", vector)])
+        .expect("triples are serializable")
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +164,21 @@ pub fn run_pipeline(
     host: &AirlockHost,
     wasm_base64: &str,
     initial_prompt: &str,
+) -> Result<ExecutionReport, TrapReport> {
+    run_pipeline_with_directive(host, wasm_base64, initial_prompt, None)
+}
+
+/// Like [`run_pipeline`], but with an optional *sanitized-directive channel*:
+/// when `directive_json_override` is `Some`, the raw prompt still passes
+/// through Layer 3 for auditing, but the bytes injected into guest memory are
+/// the caller-provided (already-valid triple JSON) instead. The Phase 6
+/// red-team endpoint uses this to hand the malicious payload its attack
+/// vector; ordinary HTTP clients can never bypass the sanitizer.
+pub fn run_pipeline_with_directive(
+    host: &AirlockHost,
+    wasm_base64: &str,
+    initial_prompt: &str,
+    directive_json_override: Option<&str>,
 ) -> Result<ExecutionReport, TrapReport> {
     // --- Control-plane input hygiene -------------------------------------
     if wasm_base64.len() > MAX_WASM_BYTES * 2 + 8 {
@@ -201,7 +224,9 @@ pub fn run_pipeline(
 
     // --- Layer 3: sanitize BEFORE anything touches guest memory --------------
     let sanitized = ontological_sanitizer::sanitize_prompt(initial_prompt);
-    let sanitized_json = sanitized.to_sanitized_json();
+    let sanitized_json = directive_json_override
+        .map(str::to_string)
+        .unwrap_or_else(|| sanitized.to_sanitized_json());
     info!(
         "layer3: {} raw bytes -> {} triples (stripped: {} invisible, {} html, {} md, {} injections)",
         sanitized.stats.raw_len,
@@ -245,6 +270,7 @@ pub fn run_pipeline(
 type Job = (
     String, // wasm_base64
     String, // initial_prompt
+    Option<String>, // trusted sanitized-directive override (Phase 6 red team)
     tokio::sync::oneshot::Sender<Result<ExecutionReport, TrapReport>>,
 );
 
@@ -271,9 +297,11 @@ impl AppState {
                 // Sequentially drain containment jobs. `run_pipeline` catches
                 // every trap internally; a panic would only kill this thread,
                 // never the accept loop (defense in depth).
-                while let Ok((wasm_b64, prompt, reply)) = rx.recv() {
+                while let Ok((wasm_b64, prompt, directive, reply)) = rx.recv() {
                     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_pipeline(&host, &wasm_b64, &prompt)
+                        run_pipeline_with_directive(
+                            &host, &wasm_b64, &prompt, directive.as_deref(),
+                        )
                     }))
                     .unwrap_or_else(|_| {
                         Err(TrapReport {
@@ -309,7 +337,11 @@ impl AppState {
 }
 
 /// Submit a pipeline job to the worker thread and await its verdict.
-async fn dispatch(state: &AppState, req: ExecuteRequest) -> Result<ExecutionReport, TrapReport> {
+async fn dispatch(
+    state: &AppState,
+    req: ExecuteRequest,
+    directive: Option<String>,
+) -> Result<ExecutionReport, TrapReport> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     {
         let guard = state
@@ -325,7 +357,7 @@ async fn dispatch(state: &AppState, req: ExecuteRequest) -> Result<ExecutionRepo
             layer: TrapLayer::EphemeralHost,
             detail: "containment worker is no longer running".to_string(),
         })?;
-        tx.send((req.wasm_base64, req.initial_prompt, reply_tx))
+        tx.send((req.wasm_base64, req.initial_prompt, directive, reply_tx))
             .map_err(|_| TrapReport {
                 trapped: true,
                 layer: TrapLayer::EphemeralHost,
@@ -353,7 +385,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             wasm_base64: String::new(),
             initial_prompt: String::new(),
         };
-        matches!(dispatch(&state, req).await, Err(trap)
+        matches!(dispatch(&state, req, None).await, Err(trap)
                  if trap.layer == TrapLayer::InputValidation)
     };
     Json(serde_json::json!({
@@ -373,7 +405,7 @@ async fn execute(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ExecuteRequest>,
 ) -> Response {
-    match dispatch(&state, req).await {
+    match dispatch(&state, req, None).await {
         Ok(report) => {
             info!(
                 "execution approved: {} bytes of clean egress, {} fuel left",
@@ -408,6 +440,43 @@ async fn execute_raw(
         initial_prompt: prompt,
     };
     execute(State(state), Json(req)).await
+}
+
+/// `POST /red-team/execute` — Phase 6 validation channel. Body is the raw
+/// wasm binary; `?vector=<name>` hands the payload its attack directive via a
+/// *pre-sanitized triple JSON* (`{"subject":"vector",...}`) that Layer 3
+/// would otherwise destroy. This bypass is only available to the trusted
+/// control plane (the red-team harness), never to ordinary `/execute`
+/// clients, which always go through the sanitizer.
+async fn red_team_execute(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    if body.len() > MAX_WASM_BYTES {
+        return TrapReport {
+            trapped: true,
+            layer: TrapLayer::InputValidation,
+            detail: format!("raw wasm body exceeds {MAX_WASM_BYTES} bytes"),
+        }
+        .into_response(StatusCode::BAD_REQUEST);
+    }
+    let vector = params.get("vector").cloned().unwrap_or_default();
+    let directive = vector_triple_json(&vector);
+    let req = ExecuteRequest {
+        wasm_base64: B64.encode(&body[..]),
+        initial_prompt: format!("red-team drill: vector is {vector}"),
+    };
+    match dispatch(&state, req, Some(directive)).await {
+        Ok(report) => {
+            info!(
+                "red-team vector '{vector}' was CONTAINED without a trap (output: {} bytes)",
+                report.output.len()
+            );
+            (StatusCode::OK, Json(report)).into_response()
+        }
+        Err(trap) => trap.into_response(StatusCode::BAD_REQUEST),
+    }
 }
 
 /// `GET /sample-wasm` — a ready-built dummy payload (base64) so the whole
@@ -450,6 +519,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/execute", post(execute))
         .route("/execute/raw", post(execute_raw))
+        .route("/red-team/execute", post(red_team_execute))
         .route("/sample-wasm", get(sample_wasm))
         .route("/demo", get(demo_page))
         .with_state(state)
